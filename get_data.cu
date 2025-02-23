@@ -2,7 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <stdexcept>
-
+#include <random> 
 int bswap(int x)
 {
     int b0 = x&255;
@@ -73,36 +73,152 @@ std::vector<unsigned char> read_labels(const std::string &filename) {
 #define TILE_WIDTH 16 
 __global__ void ConvLayerForward_Kernel(int M, int C, int H_grid, int W_grid,
                                         int K, float* X, float* W, float* Y,
-                                        int H_input, int W_input)
+                                        int H_input, int W_input,
+                                        int Y_size,int X_size)
 {
     int m = blockIdx.x; // What filter bank I am in 
     int h = (blockIdx.y/W_grid)*TILE_WIDTH + threadIdx.y;
     int w = (blockIdx.y%W_grid)*TILE_WIDTH + threadIdx.x; 
     int n = blockIdx.z; 
+    int H_output = H_input - K + 1;
+    int W_output = W_input - K + 1;
+    int y_pos = n*M*H_output*W_output + m*H_output*W_output + h * W_output + w;
     float acc = 0.;
-    for (int c=0;c<C;c++)
+    if (0 <= m && m < M && 0 <= h && h < H_output && 0 <= w && w < H_output)
     {
-        for (int p=0;p<K;p++)
+        for (int c=0;c<C;c++)
         {
-            for (int q=0;q<K;q++)
+            for (int p=0;p<K;p++)
             {
-                acc += X[n*C*H_input*W_input + c*H_input*W_input + (h+p)*W_input + w+q] * 
-                       W[m * C * K * K + c * K * K + p * K + q];
+                for (int q=0;q<K;q++)
+                {
+                    int x_idx = n*C*H_input*W_input + c*H_input*W_input + (h+p)*W_input + w+q;
+                    if (0 <= x_idx && x_idx < X_size)
+                    {
+                        acc += X[x_idx]; //W[m * C * K * K + c * K * K + p * K + q];
+                    }
+                }
+            }
+        }
+        Y[y_pos] = acc;
+    }
+}
+
+void convLayer_batched(int N,int M,int C,int H_X,int W_X,int K, float* X, float* W, float* Y)
+{
+    int H_out = H_X-K+1;
+    int W_out = W_X-K+1;
+    for (int n=0;n<N;n++)
+    {
+        for (int m=0;m<M;m++)
+        {
+            for (int h=0;h<H_out;h++)
+            {
+                for (int w=0;w<W_out;w++)
+                {
+                    int y_idx = n*M*H_out*W_out+m*H_out*W_out + h*W_out + w;
+                    Y[y_idx] = 0;
+                    for (int c=0;c<C;c++)
+                    {
+                        for (int p=0;p<K;p++)
+                        {
+                            for (int q=0;q<K;q++)
+                            {
+                                int x_idx = n*C*H_X*W_X + c*H_X*W_X+(h+p)*W_X + (w+q);
+                                int w_idx = m*C*K*K + c*K*K + p*K + q;
+                                Y[y_idx] = Y[y_idx] + X[x_idx]*W[w_idx];
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    int H_output = H_input - K + 1;
-    int W_output = W_output - K + 1;
-    Y[n*M*C*H_output*W_output + m*C*H_output*W_output + h * W_output + w] = acc;
 }
-
 
 bool test_conv_batch()
 {
-    return True;
-}
+    int N = 3 , M = 5, H_X = 28, W_X = 28, C = 3, K = 5;
+    int H_out = H_X-K+1, W_out = W_X-K+1;
+    // Random number generator setup
+    std::random_device rd;  // Seed for random number engine
+    std::mt19937 gen(rd()); // Mersenne Twister PRNG
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f); // Range [0,1]
+
+    unsigned long long size_X = N*C*H_X*W_X;
+    unsigned long long size_W =  M*C*K*K;
+    unsigned long long size_Y = N*M*H_out*W_out;
+    float *X = new float[size_X]; // It is a tensor of shape [N,C,H_X,W_X]
+    float *W = new float[size_W]; // It is a tensor of shape [M,C,K,K], also called filter banks but they're the weights
+    float *Y = new float[size_Y]; // It is a tensor of the shape [N,M,H_out,W_out]
+    float *Y_cuda_result = new float[size_Y];
+    for (int i=0;i<size_X;i++)
+    {
+        X[i] = 1;
+    }
+    for (int i=0;i<size_W;i++)
+    {
+        W[i] = 1;
+    }
+    for (int i=0;i<size_Y;i++)
+    {
+        Y[i] = 0;
+        Y_cuda_result[i] = 0;
+    }
+    float *d_X, *d_W, *d_Y;
+    cudaMalloc((void**)&d_X,sizeof(float)*size_X);
+    cudaMalloc((void**)&d_W,sizeof(float)*size_W);
+    cudaMalloc((void**)&d_Y,sizeof(float)*size_Y);
+
+    cudaMemcpy(d_X,X,sizeof(float)*size_X,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W,W,sizeof(float)*size_W,cudaMemcpyHostToDevice);
+
+    int W_grid = (W_out + TILE_WIDTH - 1)/TILE_WIDTH;
+    int H_grid = (H_out + TILE_WIDTH - 1)/TILE_WIDTH;
+    int T = H_grid*W_grid;
+    dim3 blockDim(TILE_WIDTH,TILE_WIDTH,1);
+    dim3 gridDim(M,T,N);
+    ConvLayerForward_Kernel<<<gridDim,blockDim>>>(M,C,H_grid,W_grid,K,d_X,
+                                                  d_W,d_Y,H_X,W_X,
+                                                  size_Y,size_X);
+    cudaMemcpy(Y_cuda_result,d_Y,sizeof(float)*size_Y,cudaMemcpyDeviceToHost);
+    
+    cudaFree(d_X);
+    cudaFree(d_W);
+    cudaFree(d_Y);
+
+    convLayer_batched(N,M,C,H_X,W_X,K,X,W,Y);
+
+    bool test_correct = true;
+    int number_results = 0;
+    for (int i=0;i<size_Y;i++)
+    {
+        if (Y[i]!=Y_cuda_result[i])
+        {
+            std::cout << "TEST has failed on position i = " << i << " " << "Y[i] = " << Y[i] 
+            << " " << "Y_cuda_result[i] = " << Y_cuda_result[i] <<'\n';
+            test_correct = false;
+            number_results = number_results + 1;
+        }
+    } 
+    printf("Number of wrong results: %d \n",number_results);
+    delete[] Y;
+    Y = nullptr;
+    delete[] Y_cuda_result;
+    Y_cuda_result = nullptr;
+    delete[] X;
+    X = nullptr;
+    delete[] W;
+    W = nullptr;
+    if (test_correct == true)
+    {
+        printf("INFO >>> Convolution test passed!");
+    }
+    return test_correct;
+}   
 int main() {
     try {
+        /*
         // Read images and labels
         auto images = read_images("MNIST_database/train-images.idx3-ubyte");
         auto labels = read_labels("MNIST_database/train-labels.idx1-ubyte");
@@ -113,6 +229,8 @@ int main() {
         // Access the first image and its label
         std::cout << "First image dimensions: " << images[0].size() << "x" << images[0][0].size() << std::endl;
         std::cout << "First label: " << (int)labels[0] << std::endl;
+        */
+       test_conv_batch();
     } catch (const std::exception &e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
